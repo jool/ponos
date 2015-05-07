@@ -47,7 +47,7 @@ pause(_Name, _State) ->
 start(_Name, State) ->
   {ok, State}.
 
-terminate(_Name, _State) ->
+terminate(Name, State) ->
   ok.
 
 %%%_* Emacs ============================================================

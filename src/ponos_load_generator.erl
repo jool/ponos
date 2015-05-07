@@ -30,15 +30,17 @@
 %% API
 -export([ get_duration/1
         , get_load_spec/1
+        , get_modeled_load/1
         , get_name/1
+        , get_running_tasks/1
         , get_start/1
+        , get_statistics/1
         , get_task/1
         , is_running/1
         , pause/1
         , start/1
         , start_link/1
         , stop/1
-        , top/1
         ]).
 
 %% gen_server callbacks
@@ -49,7 +51,6 @@
 %% TODO: Some unit tests are missing
 %%%_* Records and Definitions ==========================================
 -record(state, {
-          call_counter      :: integer(),
           duration          :: ponos:duration(),
           is_running        :: boolean(),
           load_spec         :: ponos:load_spec(),
@@ -57,10 +58,9 @@
           limit_reported    :: boolean(),
           name              :: ponos:name(),
           next_trigger_time :: number(),
-          intensities       :: list(erlang:now()),
           intensity         :: ponos:intensity(),
           running_tasks     :: integer(),
-          start             :: erlang:timestamp(),
+          statistics        :: ponos_statistics:ponos_statistics(),
           task_runner       :: module(),
           task              :: ponos:task(),
           tick_counter      :: integer()
@@ -85,8 +85,17 @@ get_load_spec(LoadGenerator) ->
 get_name(LoadGenerator) ->
   gen_server:call(LoadGenerator, get_name).
 
+get_running_tasks(LoadGenerator) ->
+  gen_server:call(LoadGenerator, get_running_tasks).
+
+get_modeled_load(LoadGenerator) ->
+  gen_server:call(LoadGenerator, get_modeled_load).
+
 get_start(LoadGenerator) ->
   gen_server:call(LoadGenerator, get_start).
+
+get_statistics(LoadGenerator) ->
+  gen_server:call(LoadGenerator, get_statistics).
 
 get_task(LoadGenerator) ->
   gen_server:call(LoadGenerator, get_task).
@@ -107,9 +116,6 @@ start_link(Args) ->
 stop(LoadGenerator) ->
   gen_server:call(LoadGenerator, stop).
 
-top(LoadGenerator) ->
-  gen_server:call(LoadGenerator, top).
-
 %%%_* gen_server callbacks ---------------------------------------------
 init(Args) ->
   process_flag(trap_exit, true),
@@ -122,7 +128,6 @@ init(Args) ->
 
   {ok, State} = ponos_task_runner_callbacks:init(TaskRunner, Name, RunnerArgs),
   {ok, #state{
-          call_counter      = 0,
           duration          = Duration,
           load_spec         = LoadSpec,
           is_running        = false,
@@ -130,9 +135,8 @@ init(Args) ->
           limit_reported    = false,
           name              = Name,
           next_trigger_time = 0,
-          intensities       = [],
           running_tasks     = 0,
-          start             = os:timestamp(),
+          statistics        = ponos_statistics:new(),
           task_runner       = {TaskRunner, State},
           task              = element(2, proplists:lookup(task, Args)),
           tick_counter      = 0
@@ -144,8 +148,14 @@ handle_call(get_load_spec, _From, State) ->
   {reply, state_get_load_spec(State), State};
 handle_call(get_name, _From, State) ->
   {reply, state_get_name(State), State};
+handle_call(get_modeled_load, _From, State) ->
+  {reply, calc_top_modeled_load(State), State};
+handle_call(get_running_tasks, _From, State) ->
+  {reply, state_get_running_tasks(State), State};
 handle_call(get_start, _From, State) ->
   {reply, state_get_start(State), State};
+handle_call(get_statistics, _From, State) ->
+  {reply, state_get_statistics(State), State};
 handle_call(get_task, _From, State) ->
   {reply, state_get_task(State), State};
 handle_call(is_running, _From, State) ->
@@ -156,11 +166,11 @@ handle_call(stop, _From, State) ->
   {stop, {shutdown, removed}, ok, State};
 handle_call(start, _From, State) ->
   NewState = dispatch_start(State),
-  {reply, ok, NewState};
-handle_call(top, _From, State) ->
-  Top = dispatch_top(State),
-  {reply, Top, State}.
+  {reply, ok, NewState}.
 
+handle_cast({new_response_time, ResponseTime}, State) ->
+  S = ponos_statistics:add_response_time(ResponseTime, State#state.statistics),
+  {noreply, State#state{statistics = S}};
 handle_cast(_Request, State) ->
   {noreply, State}.
 
@@ -190,7 +200,7 @@ handle_info(_Info, State) ->
   {noreply, State}.
 
 skip(State) ->
-  {noreply, maybe_prune_intensities(state_inc_tick_counter(State))}.
+  {noreply, state_inc_tick_counter(State)}.
 
 max_concurrency(State) ->
   case state_get_limit_reported(State) of
@@ -240,7 +250,7 @@ code_change(_OldVsn, LoadGenerator, _Extra) ->
 
 %%%_* gen_server dispatch ----------------------------------------------
 dispatch_trigger_task(State) ->
-  _NewState  = trigger_task_and_update_counters(State).
+  _NewState = trigger_task_and_update_counters(State).
 
 dispatch_concurrency_limit(State) ->
   {TaskRunner, RunnerState} = state_get_task_runner(State),
@@ -268,45 +278,20 @@ dispatch_terminate(_Reason, State) ->
   ponos_task_runner_callbacks:terminate(TaskRunner, Name, S),
   ok.
 
-dispatch_top(State) ->
-  Intensities = state_get_intensities(State),
-  ModeledLoad = calc_top_modeled_load(State),
-  CurrentLoad = calc_current_load(Intensities),
-  [ {current_load, CurrentLoad}
-  , {total_count,  state_get_call_counter(State)}
-  , {modeled_load, ModeledLoad}
-  , {running_tasks, state_get_running_tasks(State)}
-  ].
-
 %%%_* Internal ---------------------------------------------------------
-init_load_generator(TaskRunner, TaskRunnerState, State) ->
-  Start      = os:timestamp(),
+init_load_generator(TaskRunner, TaskRunnerState, State0) ->
+  State      = state_reset_start(State0),
+
+  Start      = state_get_start(State),
   TimePassed = time_passed_in_ms(Start, Start),
   LoadSpec   = state_get_load_spec(State),
   Intensity  = LoadSpec(trunc(TimePassed)),
   State#state{
-    start       = Start,
     intensity   = Intensity,
     is_running  = true,
     task_runner = {TaskRunner, TaskRunnerState},
     next_trigger_time = TimePassed + intensity_ms(Intensity)
    }.
-
-maybe_prune_intensities(State) ->
-  TickCounter = state_get_tick_counter(State),
-  case (TickCounter rem ?PRUNE_INTENSITY_INTERVAL == 0) of
-    true  -> do_prune_intensities(State);
-    false -> State
-  end.
-
-do_prune_intensities(State) ->
-  Intensities = state_get_intensities(State),
-  Now = os:timestamp(),
-  Fun = fun(E) ->
-            time_passed_in_ms(Now, E) < ?PRUNE_INTENSITY_INTERVAL
-        end,
-  NewIntensities = lists:takewhile(Fun, Intensities),
-  state_set_intensities(State, NewIntensities).
 
 duration_is_exceeded(Duration, TimePassed) ->
   (Duration =/= infinity) andalso (TimePassed >= Duration).
@@ -332,29 +317,30 @@ should_trigger_task(TimePassed, TriggerTime, _Intensity) ->
 trigger_task_and_update_counters(State) ->
   run_task(State),
   NewState1 = state_inc_tick_counter(State),
-  NewState2 = maybe_prune_intensities(NewState1),
-  TriggerTime = state_get_next_trigger_time(NewState2),
-  NewState3 = update_intensity(TriggerTime, NewState2),
-  NewState4 = update_counters(NewState3),
-  NewState5 = update_next_trigger_time(NewState4),
-  state_clear_limit_reported(NewState5).
+  TriggerTime = state_get_next_trigger_time(NewState1),
+  NewState2 = update_intensity(TriggerTime, NewState1),
+  NewState3 = update_counters(NewState2),
+  NewState4 = update_next_trigger_time(NewState3),
+  state_clear_limit_reported(NewState4).
 
 run_task(State) ->
-  spawn_link(fun() -> run_task(State, state_get_task(State)) end).
+  Self = self(),
+  spawn_link(fun() -> run_task(State, state_get_task(State), Self) end).
 
-run_task(State, Task) ->
+run_task(State, Task, Self) ->
   {TaskRunner, RunnerState} = state_get_task_runner(State),
   Name                      = state_get_name(State),
-  ponos_task_runner_callbacks:call(TaskRunner, Name, Task, RunnerState).
+  Before                    = os:timestamp(),
+  ponos_task_runner_callbacks:call(TaskRunner, Name, Task, RunnerState),
+  After                     = os:timestamp(),
+  ResponseTime              = round(timer:now_diff(After, Before) / 1000),
+  gen_server:cast(Self, {new_response_time, ResponseTime}).
 
 update_counters(State) ->
-  State1 = state_inc_call_counter(State),
-  State2 = state_inc_running_tasks(State1),
-  state_add_intensity(State2, os:timestamp()).
+  state_inc_running_tasks(state_inc_call_counter(State)).
 
 update_next_trigger_time(State) ->
-  Intensity   = state_get_intensity(State),
-  Freq        = freq(Intensity),
+  Freq        = freq(state_get_intensity(State)),
   TriggerTime = state_get_next_trigger_time(State),
   state_set_next_trigger_time(State, TriggerTime + Freq).
 
@@ -381,12 +367,12 @@ update_intensity(TimePassed, State) ->
   state_set_next_trigger_time( state_set_intensity(State, Intensity)
                              , TriggerTime).
 
-new_trigger_time(OldIntensity, Intensity, State) ->
+new_trigger_time(OldIntensity, CurrentIntensity, State) ->
   OldTrigger = state_get_next_trigger_time(State),
-  do_new_trigger_time(OldIntensity, Intensity, OldTrigger).
+  do_new_trigger_time(OldIntensity, CurrentIntensity, OldTrigger).
 
-do_new_trigger_time(OldIntensity, Intensity, OldTriggerTime) ->
-  Freq    = freq(Intensity),
+do_new_trigger_time(OldIntensity, CurrentIntensity, OldTriggerTime) ->
+  Freq    = freq(CurrentIntensity),
   OldFreq = freq(OldIntensity),
   case freq_increased(OldFreq, Freq) of
     false -> OldTriggerTime - (OldFreq - Freq);
@@ -404,17 +390,17 @@ freq(Intensity) when Intensity == 0 ->
 freq(Intensity) ->
   1 / intensity_ms(Intensity).
 
-calc_current_load([]) -> 0.0;
-calc_current_load(Intensities) ->
-  Period = time_passed_in_ms(os:timestamp(), lists:last(Intensities)),
-  do_calc_current_load(Intensities, Period).
+%% calc_current_load([]) -> 0.0;
+%% calc_current_load(Intensities) ->
+%%   Period = time_passed_in_ms(os:timestamp(), lists:last(Intensities)),
+%%   do_calc_current_load(Intensities, Period).
 
-do_calc_current_load(_Intensities, 0)     -> 0.0;
-do_calc_current_load(Intensities, Period) ->
-  _CurrentLoad = length(Intensities) / Period * 1000.0.
+%% do_calc_current_load(_Intensities, 0)     -> 0.0;
+%% do_calc_current_load(Intensities, Period) ->
+%%   _CurrentLoad = length(Intensities) / Period * 1000.0.
 
 calc_top_modeled_load(State) ->
-  Start = state_get_start(State),
+  Start    = state_get_start(State),
   LoadSpec = state_get_load_spec(State),
   case Start of
     undefined ->
@@ -430,39 +416,36 @@ intensity_ms(Seconds) ->
   Seconds / 1000.
 
 %% State accessors -----------------------------------------------------
-state_get_call_counter(#state{call_counter = CallCounter})    -> CallCounter.
-state_get_duration(#state{duration = Duration})               -> Duration.
-state_get_intensities(#state{intensities = Intensities})      -> Intensities.
-state_get_intensity(#state{intensity = Intensity})            -> Intensity.
-state_get_is_running(#state{is_running = IsRunning})          -> IsRunning.
-state_get_load_spec(#state{load_spec = LoadSpec})             -> LoadSpec.
-state_get_max_concurrent(#state{max_concurrent = MaxCon})     -> MaxCon.
-state_get_limit_reported(#state{limit_reported = Reported})   -> Reported.
-state_get_name(#state{name = Name})                           -> Name.
-state_get_next_trigger_time(#state{next_trigger_time = NTT})  -> NTT.
-state_get_running_tasks(#state{running_tasks = RunningTasks}) -> RunningTasks.
-state_get_start(#state{start = Start})                        -> Start.
-state_get_task(#state{task = Task})                           -> Task.
-state_get_task_runner(#state{task_runner = TaskRunner})       -> TaskRunner.
-state_get_tick_counter(#state{tick_counter = TickCounter})    -> TickCounter.
+state_get_duration(S)          -> S#state.duration.
+state_get_intensity(S)         -> S#state.intensity.
+state_get_limit_reported(S)    -> S#state.limit_reported.
+state_get_is_running(S)        -> S#state.is_running.
+state_get_load_spec(S)         -> S#state.load_spec.
+state_get_max_concurrent(S)    -> S#state.max_concurrent.
+state_get_name(S)              -> S#state.name.
+state_get_next_trigger_time(S) -> S#state.next_trigger_time.
+state_get_running_tasks(S)     -> S#state.running_tasks.
+state_get_task(S)              -> S#state.task.
+state_get_task_runner(S)       -> S#state.task_runner.
+state_get_start(S)            -> ponos_statistics:get_start(S#state.statistics).
+state_get_statistics(S)        -> S#state.statistics.
 
-state_add_intensity(State = #state{intensities = Intensities}, TimeStamp) ->
-  State#state{intensities = [TimeStamp|Intensities]}.
+state_reset_start(S) ->
+  S#state{statistics = ponos_statistics:reset_start(S#state.statistics)}.
 
-state_set_intensities(State, Intensities) when is_list(Intensities) ->
-  State#state{intensities = Intensities}.
+state_inc_call_counter(S) ->
+  S#state{
+    statistics = ponos_statistics:increase_call_counter(S#state.statistics)
+   }.
 
-state_inc_call_counter(State = #state{call_counter = CC}) ->
-  State#state{call_counter = CC + 1}.
+state_inc_running_tasks(S) ->
+  S#state{running_tasks = S#state.running_tasks + 1}.
 
-state_inc_running_tasks(State = #state{running_tasks = RTs}) ->
-  State#state{running_tasks = RTs + 1}.
+state_dec_running_tasks(S) ->
+  S#state{running_tasks = S#state.running_tasks - 1}.
 
-state_dec_running_tasks(State = #state{running_tasks = RTs}) ->
-  State#state{running_tasks = RTs - 1}.
-
-state_inc_tick_counter(State = #state{tick_counter = TC}) ->
-  State#state{tick_counter = TC + 1}.
+state_inc_tick_counter(S) ->
+  S#state{tick_counter = S#state.tick_counter + 1}.
 
 state_set_next_trigger_time(State, TriggerTime) ->
   State#state{next_trigger_time = TriggerTime}.
@@ -482,11 +465,11 @@ state_clear_limit_reported(State) ->
 %%%_* EUnit Tests ======================================================
 -ifdef(TEST).
 
-calc_current_load_test_() ->
-  [ ?_assertEqual(0.0, calc_current_load([]))
-  , ?_assertEqual(0.2, do_calc_current_load([1, 2], 10000))
-  , ?_assertEqual(0.0, do_calc_current_load([1], 0))
-  ].
+%% calc_current_load_test_() ->
+%%   [ ?_assertEqual(0.0, calc_current_load([]))
+%%   , ?_assertEqual(0.2, do_calc_current_load([1, 2], 10000))
+%%   , ?_assertEqual(0.0, do_calc_current_load([1], 0))
+%%   ].
 
 duration_is_exceeded_test_() ->
   [ ?_assertEqual(false, duration_is_exceeded(infinity, 10))

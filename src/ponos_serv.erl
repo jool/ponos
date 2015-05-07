@@ -30,6 +30,7 @@
         , get_duration/1
         , get_load_generators/0
         , get_start/1
+        , get_statistics/1
         , init_load/1
         , is_running/1
         , pause/1
@@ -64,16 +65,22 @@ add_load_generator(Name, Task, LoadSpec, Options) when is_atom(Name),
                                                        is_function(Task),
                                                        is_function(LoadSpec),
                                                        is_list(Options) ->
-  Options2 = mk_options(Options),
-  case call({add_load_generator, Name, Task, LoadSpec, Options2}) of
-    {error, {duplicated, Name}} = Reply ->
-      Reply;
-    ok ->
-      case proplists:get_value(auto_init, Options2) of
-        true  -> init_load(Name);
-        false -> ok
-      end
+  add_and_maybe_start_load_gen(Name, Task, LoadSpec, mk_options(Options)).
+
+add_and_maybe_start_load_gen(Name, Task, LoadSpec, Options) ->
+  case call({add_load_generator, Name, Task, LoadSpec, Options}) of
+    {error, {duplicated, Name}} = Reply -> Reply;
+    ok                                  -> maybe_start_load_gen(Name, Options)
   end.
+
+maybe_start_load_gen(Name, Options) ->
+  case should_auto_init(Options) of
+    true  -> init_load(Name);
+    false -> ok
+  end.
+
+should_auto_init(Options) ->
+  proplists:get_value(auto_init, Options).
 
 %% @private
 mk_options(Options) ->
@@ -97,6 +104,9 @@ get_load_generators() ->
 
 get_start(Name) ->
   call({get_start, Name}).
+
+get_statistics(Name) ->
+  call({get_statistics, Name}).
 
 -spec init_load(ponos:name()) -> ok
                                  | {error, {non_existing, ponos:name()}}
@@ -137,6 +147,8 @@ handle_call(get_load_generators, _From, State) ->
   server_get_load_generators(State);
 handle_call({get_start, Name}, _From, State) ->
   server_get_start(Name, State);
+handle_call({get_statistics, Name}, _From, State) ->
+  server_get_statistics(Name, State);
 handle_call({init_load, Name}, _From, State) ->
   server_init_load(Name, State);
 handle_call({is_running, Name}, _From, State) ->
@@ -206,7 +218,7 @@ mk_load_generators_list(State) ->
   orddict:fold(fun collect_top_and_name_for/3, [], get_load_generators(State)).
 
 collect_top_and_name_for(Name, {LoadGenPid, _Ref}, Acc) ->
-  LoadGenerator = [{name, Name}|ponos_load_generator:top(LoadGenPid)],
+  LoadGenerator = [{name, Name}|load_generator_top(LoadGenPid)],
   [LoadGenerator|Acc].
 
 server_get_start(Name, State) ->
@@ -254,6 +266,14 @@ server_remove_load_generator(Name, State) ->
         end,
   execute_on_existing(Name, Fun, State).
 
+server_get_statistics(Name, State) ->
+  Fun = fun() ->
+            LoadGen = fetch_load_generator(Name, State),
+            Stats = ponos_load_generator:get_statistics(LoadGen),
+            {reply, {ok, Stats}, State}
+        end,
+  execute_on_existing(Name, Fun, State).
+
 shutdown_load_generator(LoadGen) ->
   ponos_load_generator:stop(LoadGen).
 
@@ -264,9 +284,20 @@ server_top(State) ->
 
 top_for_all_running_load_gens(State) ->
   Fun = fun(_Key, {LoadGenPid, _}) ->
-            ponos_load_generator:top(LoadGenPid)
+            load_generator_top(LoadGenPid)
         end,
   orddict:map(Fun, get_load_generators(State)).
+
+load_generator_top(LoadGenPid) ->
+  Stats        = ponos_load_generator:get_statistics(LoadGenPid),
+  CurrentLoad  = ponos_statistics:get_average_load(Stats),
+  ModeledLoad  = ponos_load_generator:get_modeled_load(LoadGenPid),
+  RunningTasks = ponos_load_generator:get_running_tasks(LoadGenPid),
+  [ {current_load, CurrentLoad}
+  , {modeled_load, ModeledLoad}
+  , {running_tasks, RunningTasks}
+  , {total_count, ponos_statistics:get_call_counter(Stats)}
+  ].
 
 sum_top_results(AllTop, State) ->
   InitAcc = orddict:from_list([ {current_load, 0.0}

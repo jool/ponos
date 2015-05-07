@@ -26,6 +26,7 @@
 %% API
 -export([ add_load_generators/1
         , get_load_generators/0
+        , get_statistics/1
         , init_load_generators/0
         , init_load_generators/1
         , is_running/1
@@ -173,6 +174,9 @@ top() ->
 %% @hidden
 start() ->
   application:start(ponos).
+
+get_statistics(Name) ->
+  ponos_serv:get_statistics(Name).
 
 %%%_* Internal ---------------------------------------------------------
 -spec get_all_names() -> [name()].
